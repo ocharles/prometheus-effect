@@ -14,23 +14,38 @@ type StaticCounter = Metric Static Counter
 type StaticHistogram = Metric Static Histogram
 
 data Metrics = Metrics { counter :: StaticCounter
-                       , selfTimer :: StaticHistogram
+                       , histogram :: StaticHistogram
+                       , counterTimer :: StaticHistogram
+                       , histogramTimer :: StaticHistogram
                        }
 
 main :: IO ()
 main = do
   Metrics {..} <-
-    pushMetrics "localhost" 80 "/metrics/job/test/instance/foo" $
+    pushMetrics "localhost" 9091 "/metrics/job/test/instance/foo" $
     register
       (do counter <-
-            newMetric "ollie_requests_served_total" "Testing" mempty Counter
-          selfTimer <-
+            newMetric "prom_test_counter" "Testing" mempty Counter
+          histogram <-
             newMetric
-              "ollie_requests_duration_seconds5"
+              "prom_test_histo"
               ""
               mempty
-              (Histogram (exponentialBuckets 0.0000000001 10 10))
+              (Histogram (exponentialBuckets 1e-12 10 10))
+          counterTimer <-
+            newMetric
+              "prom_incCounter"
+              ""
+              mempty
+              (Histogram (exponentialBuckets 1e-12 10 10))
+          histogramTimer <-
+            newMetric
+              "prom_observe"
+              ""
+              mempty
+              (Histogram (exponentialBuckets 1e-12 10 10))
           return Metrics {..})
   run 5811 $ \req respond -> do
-    withMetric counter $ \c -> withMetric selfTimer $ time $ incCounter c
+    withMetric counter $ \c -> withMetric counterTimer $ time $ incCounter c
+    withMetric histogram $ \c -> withMetric histogramTimer $ time $ observe 1 c
     respond $ responseLBS status200 [] "Hello World"

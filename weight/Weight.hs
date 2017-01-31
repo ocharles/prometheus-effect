@@ -29,3 +29,10 @@ main = do
           action "decGauge" (decGaugeBy 1 g)
           action "resetGauge" (resetGauge 10 g)
           action "observe" (observe 1 h)
+
+          -- action "incCounter" (incCounter c)
+          -- action "addCounter" (addCounter 10 c)
+          -- action "incGauge" (incGaugeBy 1 g)
+          -- action "decGauge" (decGaugeBy 1 g)
+          -- action "resetGauge" (resetGauge 10 g)
+          -- action "observe" (observe 1 h)

@@ -57,22 +57,18 @@ module Prometheus
   , time
   ) where
 
-import GHC.Int (Int64(..))
-import GHC.Float (Double(..))
-import GHC.Prim (Int#, Double#, (+##), (+#), MutVar#)
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar
        (MVar, newMVar, modifyMVar, modifyMVar_, readMVar, withMVar)
 import Control.Exception
-import Control.Monad (when, forever)
+import Control.Monad (forever)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State (modify)
 import Control.Monad.Trans.State (StateT, runStateT, mapStateT)
 import Data.ByteString.Builder (Builder, doubleDec)
 import Data.Foldable (for_)
 import Data.IORef
-       (IORef, newIORef, readIORef, atomicModifyIORef', writeIORef,
-        atomicWriteIORef)
+       (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import Data.Int (Int64)
 import Data.List (intersperse)
 import Data.Map.Strict (Map)
@@ -86,7 +82,10 @@ import Data.Vector.Unboxed (Vector)
 import qualified Data.Vector.Unboxed as V
 import Data.Vector.Unboxed.Mutable (IOVector)
 import qualified Data.Vector.Unboxed.Mutable as MV
+import GHC.Float (Double(..))
+import GHC.Int (Int64(..))
 import GHC.OverloadedLabels (IsLabel(..))
+import GHC.Prim (Int#, Double#, (+##), (+#))
 import GHC.TypeLits (KnownSymbol, symbolVal, symbolVal')
 import Labels ((:=)(..))
 import qualified Network.HTTP.Types as HTTP
@@ -169,7 +168,7 @@ incCounter = addCounter 1
 
 addCounter :: MonadIO m => Double -> Counter -> m ()
 addCounter delta CounterData {counterCount} =
-  liftIO (atomicModifyIORef' counterCount (\n -> (n + delta, ())))
+  liftIO (modifyIORef' counterCount (\n -> n + delta))
 {-# INLINE addCounter #-}
 
 newtype Gauge = GaugeData Counter
@@ -184,7 +183,7 @@ decGaugeBy delta (GaugeData counter) = addCounter delta counter
 
 resetGauge :: (MonadIO m) => Double -> Gauge -> m ()
 resetGauge n (GaugeData CounterData {counterCount}) =
-  liftIO (atomicWriteIORef counterCount n)
+  liftIO (writeIORef counterCount n)
 {-# INLINE resetGauge #-}
 
 withMetric :: Metric Static metric -> (metric -> a) -> a
