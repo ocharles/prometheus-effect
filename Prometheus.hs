@@ -18,7 +18,7 @@ module Prometheus
   , MetricOpts(..)
   , MetricName
   , MetricHelp
-  , StaticLabels
+  , StaticLabels(..)
 
     -- ** Registering
   , Unregistered
@@ -453,13 +453,11 @@ buildRegistry :: RegistryT m a -> m (a, Registry)
 buildRegistry (RegistryT s) = runStateT s (Registry mempty)
 
 publishRegistryMiddleware
-  :: Monad m
-  => [Text] -> Registry -> m Wai.Middleware
-publishRegistryMiddleware path reg = do
-  return $ \app req respond ->
-    if Wai.requestMethod req == HTTP.methodGet && Wai.pathInfo req == path
-      then respond (respondWithMetrics reg)
-      else app req respond
+  :: [Text] -> Registry -> Wai.Middleware
+publishRegistryMiddleware path reg app req respond =
+  if Wai.requestMethod req == HTTP.methodGet && Wai.pathInfo req == path
+    then respond (respondWithMetrics reg)
+    else app req respond
 
 pushMetrics
   :: MonadIO m
