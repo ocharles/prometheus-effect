@@ -30,7 +30,7 @@ module Prometheus
   , SuppliesValues
 
     -- * Publishing Metrics
-  , registerToMiddleware
+  , publishRegistryMiddleware
   , pushMetrics
   , buildRegistry
 
@@ -42,6 +42,7 @@ module Prometheus
   , Counter
   , incCounter
   , addCounter
+  , countExceptions
 
     -- ** Gauges
   , Gauge
@@ -57,7 +58,8 @@ module Prometheus
   , time
   ) where
 
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Retry (recoverAll, capDelay, exponentialBackoff)
+import Control.Concurrent (forkIO, threadDelay, ThreadId)
 import Control.Concurrent.MVar
        (MVar, newMVar, modifyMVar, modifyMVar_, readMVar, withMVar)
 import Control.Exception
@@ -65,6 +67,7 @@ import Control.Monad (forever)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State (modify)
 import Control.Monad.Trans.State (StateT, runStateT, mapStateT)
+import Data.ByteString (ByteString)
 import Data.ByteString.Builder (Builder, doubleDec)
 import Data.Foldable (for_)
 import Data.IORef
@@ -77,7 +80,7 @@ import Data.Monoid ((<>))
 import Data.Sequence (Seq, (|>))
 import Data.String (IsString)
 import Data.Text (Text, pack)
-import Data.Text.Encoding (encodeUtf8Builder)
+import Data.Text.Encoding (encodeUtf8Builder, decodeUtf8)
 import Data.Vector.Unboxed (Vector)
 import qualified Data.Vector.Unboxed as V
 import Data.Vector.Unboxed.Mutable (IOVector)
@@ -91,7 +94,7 @@ import Labels ((:=)(..))
 import qualified Network.HTTP.Types as HTTP
 import Network.Http.Client
        (withConnection, buildRequest, http, sendRequest, Method(POST),
-        openConnection)
+        openConnection, Hostname, Port)
 import qualified Network.Wai as Wai
 import Numeric.Natural (Natural)
 import System.Clock
@@ -252,13 +255,17 @@ instance StreamMetric Static where
                            , metricRetrieve
                            } = do
     let nameBuilder = encodeUtf8Builder name
+        nameWithLabels = encodeUtf8Builder name <> buildLabels (fmap encodeUtf8Builder labels)
     emit ("# HELP " <> nameBuilder <> " " <> encodeUtf8Builder help <> "\n")
     emit ("# TYPE " <> nameBuilder <> " " <> metricType <> "\n")
     let Static metric = metricRetrieve
     case metric of
       ACounter CounterData {counterCount} -> do
         n <- readIORef counterCount
-        emit (nameBuilder <> " " <> doubleDec n)
+        emit (nameWithLabels <> " " <> doubleDec n)
+      AGauge (GaugeData CounterData {counterCount}) -> do
+        n <- readIORef counterCount
+        emit (nameWithLabels <> " " <> doubleDec n)
       AHistogram HistogramData {..} -> do
         (obs, SumAndCount (# s, count #)) <-
           withMVar histogramSumAndCount $ \sumCount -> do
@@ -309,6 +316,7 @@ buildLabels labels
 instance StreamMetric (Dynamic keys) where
   streamMetric emit Metric { metricName = MetricName name
                            , metricHelp = MetricHelp help
+                           , metricStaticLabels = StaticLabels static
                            , metricOpts
                            , metricRetrieve
                            } = do
@@ -317,14 +325,18 @@ instance StreamMetric (Dynamic keys) where
     emit ("# TYPE " <> nameBuilder <> " " <> metricType)
     let Dynamic dyn = metricRetrieve
     variants <- readMVar dyn
-    forVariants variants $ \labels metric ->
+    forVariants variants $ \labels metric -> do
+      let composedLabels = fmap encodeUtf8Builder (static <> labels)
+          nameWithLabels = nameBuilder <> buildLabels composedLabels
       case metric of
         ACounter CounterData {counterCount} -> do
           n <- readIORef counterCount
           emit "\n"
-          emit
-            (nameBuilder <> buildLabels (fmap encodeUtf8Builder labels) <> " " <>
-             doubleDec n)
+          emit (nameWithLabels <> " " <> doubleDec n)
+        AGauge (GaugeData CounterData {counterCount}) -> do
+          n <- readIORef counterCount
+          emit "\n"
+          emit (nameWithLabels <> " " <> doubleDec n)
         AHistogram HistogramData {..} -> do
           (obs, SumAndCount (# s, count #)) <-
             withMVar histogramSumAndCount $ \sumCount -> do
@@ -336,7 +348,7 @@ instance StreamMetric (Dynamic keys) where
                emit
                  (nameBuilder <>
                   buildLabels
-                    (fmap encodeUtf8Builder labels <>
+                    (fmap encodeUtf8Builder (labels <> static) <>
                      Map.singleton
                        "le"
                        (doubleDec (histogramBucketBounds V.! i))) <>
@@ -346,10 +358,10 @@ instance StreamMetric (Dynamic keys) where
                return acc') 0
             obs
           emit
-            (nameBuilder <> "_sum" <> buildLabels (fmap encodeUtf8Builder labels) <> " " <>
+            (nameBuilder <> "_sum" <> buildLabels composedLabels <> " " <>
              doubleDec (D# s) <> "\n")
           emit
-            (nameBuilder <> "_count" <> buildLabels (fmap encodeUtf8Builder labels) <>
+            (nameBuilder <> "_count" <> buildLabels composedLabels <>
              " " <>
              encodeUtf8Builder (pack (show (I64# count))))
     where
@@ -386,7 +398,8 @@ newtype Buckets = Buckets (Vector Double)
 linearBuckets :: Double -> Double -> Natural -> Buckets
 linearBuckets start width numBuckets =
   Buckets
-    (V.map (start +) (V.replicate (fromIntegral numBuckets) width))
+    (V.prescanl' (+) start (V.replicate (fromIntegral numBuckets) width) <>
+     V.singleton (read "Infinity"))
 
 -- @exponentialBuckets @start factor numBuckets@ creates @numBuckets@ buckets,
 -- where the lowest bucket has an upper bound of @start@ and each following
@@ -395,10 +408,8 @@ exponentialBuckets :: Double -> Double -> Natural -> Buckets
 exponentialBuckets start factor numBuckets
   | start > 0 && factor > 1 =
     Buckets
-      (V.postscanl'
-         (*)
-         start
-         (V.replicate (fromIntegral numBuckets) factor))
+      (V.prescanl' (*) start (V.replicate (fromIntegral numBuckets) factor) <>
+       V.singleton (read "Infinity"))
   | otherwise = error "Invalid arguments"
 
 time
@@ -408,14 +419,19 @@ time m histogram =
     (liftIO (getTime Monotonic))
     (\t0 -> do
        t <- liftIO (getTime Monotonic)
-       let delta = fromIntegral (toNanoSecs (t - t0)) * 10e-9
+       let delta = fromIntegral (toNanoSecs (t - t0)) * 1e-9
        observe delta histogram)
     (\_t0 -> m)
 {-# INLINE time #-}
 
+countExceptions
+  :: IO a -> Counter -> IO a
+countExceptions m c = m `onException` incCounter c
+{-# INLINE countExceptions #-}
+
 observe :: Double -> Histogram -> IO ()
 observe a@(D# a#) HistogramData {..} = do
-  let i = V.findIndex (<= a) histogramBucketBounds
+  let i = V.findIndex (a <=) histogramBucketBounds
   seq i $
     modifyMVar_ histogramSumAndCount $ \(SumAndCount (# s, count #)) -> do
       for_ i (MV.unsafeModify histogramObservations succ)
@@ -436,31 +452,68 @@ newtype Unregistered a = Unregistered (RegistryT IO a)
 buildRegistry :: RegistryT m a -> m (a, Registry)
 buildRegistry (RegistryT s) = runStateT s (Registry mempty)
 
-
-registerToMiddleware
+publishRegistryMiddleware
   :: Monad m
-  => [Text] -> RegistryT m a -> m (Wai.Middleware, a)
-registerToMiddleware path (RegistryT s) = do
-  (a, reg) <- runStateT s (Registry mempty)
-  let middleware app req respond =
-        if Wai.requestMethod req == HTTP.methodGet && Wai.pathInfo req == path
-          then respond (respondWithMetrics reg)
-          else app req respond
-  return (middleware, a)
+  => [Text] -> Registry -> m Wai.Middleware
+publishRegistryMiddleware path reg = do
+  return $ \app req respond ->
+    if Wai.requestMethod req == HTTP.methodGet && Wai.pathInfo req == path
+      then respond (respondWithMetrics reg)
+      else app req respond
 
-pushMetrics host port path (RegistryT s) = do
-  (a, reg) <- runStateT s (Registry mempty)
-  forkIO
-    (withConnection
-       (openConnection host port)
-       (\c -> forever $ do
-          req <- buildRequest $ http POST path
-          sendRequest
-            c
-            req
-            (\out -> outputRegistry reg (\b -> write (Just b) out))
-          threadDelay 1000000))
-  return a
+pushMetrics
+  :: MonadIO m
+  => Hostname -> Port -> ByteString -> Unregistered (Registry -> m ThreadId)
+pushMetrics host port path = do
+  let labels =
+        StaticLabels
+          (Map.fromList
+             [ ("host", decodeUtf8 host)
+             , ("port", pack (show port))
+             , ("path", decodeUtf8 "path")
+             ])
+  pushLatency <-
+    newMetric
+      "haskell_prometheus_push_latency_seconds"
+      "The latency when pushing metrics to a Pushgateway"
+      labels
+      (Histogram (exponentialBuckets 1e-6 10 7))
+  pushInterval <-
+    newMetric
+      "haskell_prometheus_push_interval_seconds"
+      "The interval between pushes"
+      labels
+      (Histogram (linearBuckets 1 1 10))
+  pushExceptions <-
+    newMetric
+      "haskell_prometheus_push_exceptions_total"
+      "Total count of exceptions while pushing metrics"
+      labels
+      Counter
+  return $ \reg ->
+    liftIO $
+    forkIO $ do
+      req <- buildRequest $ http POST path
+      recoverAll (capDelay 60000000 $ exponentialBackoff 500000) $ \_ ->
+        withMetric pushExceptions $
+        countExceptions $
+        withConnection (openConnection host port) $ \c ->
+          forever $
+          withMetric pushInterval $
+          time $ do
+            t0 <- getTime Monotonic
+            withMetric pushLatency $
+              time $
+              sendRequest
+                c
+                req
+                (\out -> outputRegistry reg (\b -> write (Just b) out))
+            t <- getTime Monotonic
+            let delta =
+                  fromIntegral (toNanoSecs (t - t0)) * 1e-3 :: Double
+                delay = round (5e6 - delta)
+            threadDelay delay
+
 
 outputRegistry :: Registry -> (Builder -> IO ()) -> IO ()
 outputRegistry (Registry reg) emit = do

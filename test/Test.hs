@@ -8,6 +8,7 @@ import Data.Monoid
 import Network.Wai
 import Network.Wai.Handler.Warp
 import Prometheus
+import Prometheus.GHC
 import Network.HTTP.Types
 
 type StaticCounter = Metric Static Counter
@@ -21,8 +22,8 @@ data Metrics = Metrics { counter :: StaticCounter
 
 main :: IO ()
 main = do
-  Metrics {..} <-
-    pushMetrics "localhost" 9091 "/metrics/job/test/instance/foo" $
+  ((Metrics {..}, collectGHCStats, pusher), registry) <-
+    buildRegistry $
     register
       (do counter <-
             newMetric "prom_test_counter" "Testing" mempty Counter
@@ -44,8 +45,13 @@ main = do
               ""
               mempty
               (Histogram (exponentialBuckets 1e-12 10 10))
-          return Metrics {..})
-  run 5811 $ \req respond -> do
+          collectGHCStats <- ghcStats
+          pusher <- pushMetrics "localhost" 9091 "/metrics/job/j/instance/i"
+          return (Metrics {..}, collectGHCStats, pusher))
+  collectGHCStats
+  pusher registry
+  mw <- publishRegistryMiddleware ["metrics"] registry
+  run 5811 $ mw $ \req respond -> do
     withMetric counter $ \c -> withMetric counterTimer $ time $ incCounter c
     withMetric histogram $ \c -> withMetric histogramTimer $ time $ observe 1 c
     respond $ responseLBS status200 [] "Hello World"
