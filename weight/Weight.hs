@@ -7,32 +7,28 @@ import Data.Monoid
 import Weigh
 import Prometheus
 
-data Metrics = Metrics { testCounter :: Metric Static Counter
-                       , testGauge :: Metric Static Gauge
-                       , testHistogram :: Metric Static Histogram
+data Metrics = Metrics { testCounter :: Counter
+                       , testGauge :: Gauge
+                       , testHistogram :: Histogram
                        }
 
 main :: IO ()
 main = do
   (Metrics {..}, _) <-
     buildRegistry $
-    Metrics <$> newMetric "counter" "" mempty Counter <*>
-    newMetric "gauge" "" mempty Gauge <*>
-    newMetric "histogram" "" mempty (Histogram (linearBuckets 0 1 10))
-  withMetric testCounter $ \c ->
-    withMetric testGauge $ \g ->
-      withMetric testHistogram $ \h ->
-        mainWith $ do
-          action "incCounter" (incCounter c)
-          action "addCounter" (addCounter 10 c)
-          action "incGauge" (incGaugeBy 1 g)
-          action "decGauge" (decGaugeBy 1 g)
-          action "resetGauge" (resetGauge 10 g)
-          action "observe" (observe 1 h)
-
-          -- action "incCounter" (incCounter c)
-          -- action "addCounter" (addCounter 10 c)
-          -- action "incGauge" (incGaugeBy 1 g)
-          -- action "decGauge" (decGaugeBy 1 g)
-          -- action "resetGauge" (resetGauge 10 g)
-          -- action "observe" (observe 1 h)
+    Metrics <$> register "counter" "" mempty counter <*>
+    register "gauge" "" mempty gauge <*>
+    register "histogram" "" mempty (histogram (linearBuckets 0 1 10))
+  mainWith $ do
+    action "incCounter" (incCounter testCounter)
+    action "addCounter" (incCounterBy testCounter 10)
+    action "incGauge" (incGauge testGauge)
+    action "decGauge" (decGauge testGauge)
+    action "resetGauge" (setGauge testGauge 10)
+    action "observe" (observe 1 testHistogram)
+-- action "incCounter" (incCounter c)
+-- action "addCounter" (addCounter 10 c)
+-- action "incGauge" (incGaugeBy 1 g)
+-- action "decGauge" (decGaugeBy 1 g)
+-- action "resetGauge" (resetGauge 10 g)
+-- action "observe" (observe 1 h)

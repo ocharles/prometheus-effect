@@ -11,46 +11,45 @@ import Prometheus
 import Prometheus.GHC
 import Network.HTTP.Types
 
-type StaticCounter = Metric Static Counter
-type StaticHistogram = Metric Static Histogram
-
-data Metrics = Metrics { counter :: StaticCounter
-                       , histogram :: StaticHistogram
-                       , counterTimer :: StaticHistogram
-                       , histogramTimer :: StaticHistogram
-                       }
+data Metrics = Metrics
+  { testcounter :: Counter
+  , testhistogram :: Histogram
+  , testcounterTimer :: Histogram
+  , testhistogramTimer :: Histogram
+  }
 
 main :: IO ()
 main = do
-  ((Metrics {..}, collectGHCStats, pusher), registry) <-
+  ((Metrics {..}, pusher), registry) {- collectGHCStats, -}
+     <-
     buildRegistry $ do
-      counter <- newMetric "prom_test_counter" "Testing" mempty Counter
-      histogram <-
-        newMetric
+      testcounter <- register "prom_test_counter" "Testing" mempty counter
+      testhistogram <-
+        register
           "prom_test_histo"
           ""
           mempty
-          (Histogram (exponentialBuckets 1e-12 10 10))
-      counterTimer <-
-        newMetric
+          (histogram (exponentialBuckets 1e-12 10 10))
+      testcounterTimer <-
+        register
           "prom_incCounter"
           ""
           mempty
-          (Histogram (exponentialBuckets 1e-12 10 10))
-      histogramTimer <-
-        newMetric
+          (histogram (exponentialBuckets 1e-12 10 10))
+      testhistogramTimer <-
+        register
           "prom_observe"
           ""
           mempty
-          (Histogram (exponentialBuckets 1e-12 10 10))
-      collectGHCStats <- ghcStats
+          (histogram (exponentialBuckets 1e-12 10 10))
+      -- collectGHCStats <- ghcStats
       pusher <- pushMetrics "localhost" 9091 "/metrics/job/j/instance/i"
-      return (Metrics {..}, collectGHCStats, pusher)
-  collectGHCStats
+      return (Metrics {..}, pusher) {- collectGHCStats, -}
+  -- collectGHCStats
   pusher registry
-  run 5811 $
-    publishRegistryMiddleware ["metrics"] registry $ \req respond -> do
-      withMetric counter $ \c -> withMetric counterTimer $ time $ incCounter c
-      withMetric histogram $ \c ->
-        withMetric histogramTimer $ time $ observe 1 c
-      respond $ responseLBS status200 [] "Hello World"
+  run 5811 $ \req respond
+                  -- publishRegistryMiddleware ["metrics"] registry $ \req respond -> do
+   -> do
+    time testcounterTimer $ incCounter testcounter
+    time testhistogramTimer $ observe 1 testhistogram
+    respond $ responseLBS status200 [] "Hello World"
