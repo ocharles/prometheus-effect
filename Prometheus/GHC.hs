@@ -2,6 +2,7 @@
 
 module Prometheus.GHC where
 
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad (forever)
 import Control.Concurrent
 import Data.Monoid (mempty)
@@ -9,13 +10,16 @@ import qualified GHC.Stats as GHC
 import Prometheus
 
 newUnlabelledMetric
-  :: MetricName
+  :: (MonadRegistry m, MonadIO m)
+  => MetricName
   -> MetricHelp
   -> MetricOpts metricType
-  -> Unregistered (Metric Static metricType)
+  -> m (Metric Static metricType)
 newUnlabelledMetric n h t = newMetric n h mempty t
 
-ghcStats :: Unregistered (IO ThreadId)
+ghcStats
+  :: (MonadRegistry m, MonadIO m, MonadIO n)
+  => m (n ThreadId)
 ghcStats = do
   bytesAllocated <-
     newUnlabelledMetric
@@ -118,6 +122,7 @@ ghcStats = do
       "Amount of time spent by the Prometheus library recording GHC statistics"
       (Histogram (exponentialBuckets 1e-12 10 10))
   return $
+    liftIO $
     forkIO $ do
       enabled <- GHC.getGCStatsEnabled
       case enabled of

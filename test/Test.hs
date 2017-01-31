@@ -23,35 +23,34 @@ data Metrics = Metrics { counter :: StaticCounter
 main :: IO ()
 main = do
   ((Metrics {..}, collectGHCStats, pusher), registry) <-
-    buildRegistry $
-    register
-      (do counter <-
-            newMetric "prom_test_counter" "Testing" mempty Counter
-          histogram <-
-            newMetric
-              "prom_test_histo"
-              ""
-              mempty
-              (Histogram (exponentialBuckets 1e-12 10 10))
-          counterTimer <-
-            newMetric
-              "prom_incCounter"
-              ""
-              mempty
-              (Histogram (exponentialBuckets 1e-12 10 10))
-          histogramTimer <-
-            newMetric
-              "prom_observe"
-              ""
-              mempty
-              (Histogram (exponentialBuckets 1e-12 10 10))
-          collectGHCStats <- ghcStats
-          pusher <- pushMetrics "localhost" 9091 "/metrics/job/j/instance/i"
-          return (Metrics {..}, collectGHCStats, pusher))
+    buildRegistry $ do
+      counter <- newMetric "prom_test_counter" "Testing" mempty Counter
+      histogram <-
+        newMetric
+          "prom_test_histo"
+          ""
+          mempty
+          (Histogram (exponentialBuckets 1e-12 10 10))
+      counterTimer <-
+        newMetric
+          "prom_incCounter"
+          ""
+          mempty
+          (Histogram (exponentialBuckets 1e-12 10 10))
+      histogramTimer <-
+        newMetric
+          "prom_observe"
+          ""
+          mempty
+          (Histogram (exponentialBuckets 1e-12 10 10))
+      collectGHCStats <- ghcStats
+      pusher <- pushMetrics "localhost" 9091 "/metrics/job/j/instance/i"
+      return (Metrics {..}, collectGHCStats, pusher)
   collectGHCStats
   pusher registry
-  mw <- publishRegistryMiddleware ["metrics"] registry
-  run 5811 $ mw $ \req respond -> do
-    withMetric counter $ \c -> withMetric counterTimer $ time $ incCounter c
-    withMetric histogram $ \c -> withMetric histogramTimer $ time $ observe 1 c
-    respond $ responseLBS status200 [] "Hello World"
+  run 5811 $
+    publishRegistryMiddleware ["metrics"] registry $ \req respond -> do
+      withMetric counter $ \c -> withMetric counterTimer $ time $ incCounter c
+      withMetric histogram $ \c ->
+        withMetric histogramTimer $ time $ observe 1 c
+      respond $ responseLBS status200 [] "Hello World"

@@ -21,8 +21,8 @@ module Prometheus
   , StaticLabels(..)
 
     -- ** Registering
-  , Unregistered
-  , register
+  , MonadRegistry(..)
+  , Unregistered(..)
 
     -- * Updating Metrics
   , withMetric
@@ -56,20 +56,26 @@ module Prometheus
   , linearBuckets, exponentialBuckets
   , observe
   , time
+
+    -- * Instrumentation
+  , instrumentRequests
   ) where
 
-import Control.Retry (recoverAll, capDelay, exponentialBackoff)
+import Control.Exception.Safe
+       (MonadMask, onException, finally)
 import Control.Concurrent (forkIO, threadDelay, ThreadId)
 import Control.Concurrent.MVar
        (MVar, newMVar, modifyMVar, modifyMVar_, readMVar, withMVar)
-import Control.Exception
 import Control.Monad (forever)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State (modify)
-import Control.Monad.Trans.State (StateT, runStateT, mapStateT)
+import Control.Monad.Trans.State
+       (StateT(..), runStateT, mapStateT, State)
+import Control.Retry (recoverAll, capDelay, exponentialBackoff)
 import Data.ByteString (ByteString)
 import Data.ByteString.Builder (Builder, doubleDec)
 import Data.Foldable (for_)
+import Data.Functor.Identity (Identity(..))
 import Data.IORef
        (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import Data.Int (Int64)
@@ -155,15 +161,15 @@ construct (Histogram (Buckets histogramBucketBounds)) = do
   return $! AHistogram (HistogramData {..})
 
 newMetric
-  :: MetricName
+  :: (MonadRegistry m, MonadIO m)
+  => MetricName
   -> MetricHelp
   -> StaticLabels
   -> MetricOpts metricType
-  -> Unregistered (Metric Static metricType)
-newMetric metricName metricHelp metricStaticLabels metricOpts =
-  toRegister $ do
-    metric <- liftIO (construct metricOpts)
-    return $! Metric {metricRetrieve = Static metric, ..}
+  -> m (Metric Static metricType)
+newMetric metricName metricHelp metricStaticLabels metricOpts = do
+  metric <- liftIO (construct metricOpts)
+  registerMetric $! Metric {metricRetrieve = Static metric, ..}
 
 incCounter :: MonadIO m => Counter -> m ()
 incCounter = addCounter 1
@@ -201,16 +207,16 @@ withMetric Metric {metricRetrieve} f =
 newtype Dynamic labelKeys a = Dynamic (MVar (Map (Map Text Text) a))
 
 newDynamicMetric
-  :: MetricName
+  :: (MonadRegistry m, MonadIO m)
+  => MetricName
   -> MetricHelp
   -> StaticLabels
   -> dynamicLabels
   -> MetricOpts metricType
-  -> Unregistered (Metric (Dynamic dynamicLabels) metricType)
-newDynamicMetric metricName metricHelp metricStaticLabels _dynamicLabels metricOpts =
-  toRegister $ do
-    dynamicMetrics <- liftIO (newMVar Map.empty)
-    return $! Metric {metricRetrieve = Dynamic dynamicMetrics, ..}
+  -> m (Metric (Dynamic dynamicLabels) metricType)
+newDynamicMetric metricName metricHelp metricStaticLabels _dynamicLabels metricOpts = do
+  dynamicMetrics <- liftIO (newMVar Map.empty)
+  registerMetric $! Metric {metricRetrieve = Dynamic dynamicMetrics, ..}
 {-# INLINE newDynamicMetric #-}
 
 class SuppliesValues (labelKeys :: k) labelValues where
@@ -223,21 +229,19 @@ instance v ~ Text => SuppliesValues (LabelKey k) (k := v) where
   labelMap _ (p := v) = Map.singleton (pack (symbolVal p)) v
 
 withDynamicMetric
-  :: SuppliesValues labelKeys labelValues
-  => Metric (Dynamic labelKeys) metric
-  -> labelValues
-  -> (metric -> IO b)
-  -> IO b
+  :: (SuppliesValues labelKeys labelValues, MonadIO m)
+  => Metric (Dynamic labelKeys) metric -> labelValues -> (metric -> m b) -> m b
 withDynamicMetric m@Metric {..} labels f = do
   let lbls = labelMap m labels
       Dynamic dynMapIORef = metricRetrieve
   metric <-
-    do modifyMVar dynMapIORef $ \dynMap -> do
-         case Map.lookup lbls dynMap of
-           Nothing -> do
-             metric <- construct metricOpts
-             return (Map.insert lbls metric dynMap, metric)
-           Just metric -> return (dynMap, metric)
+    do liftIO $
+         modifyMVar dynMapIORef $ \dynMap -> do
+           case Map.lookup lbls dynMap of
+             Nothing -> do
+               metric <- construct metricOpts
+               return (Map.insert lbls metric dynMap, metric)
+             Just metric -> return (dynMap, metric)
   case metric of
     ACounter a -> f a
     AGauge a -> f a
@@ -413,24 +417,43 @@ exponentialBuckets start factor numBuckets
   | otherwise = error "Invalid arguments"
 
 time
-  :: IO a -> Histogram -> IO a
-time m histogram =
-  bracket
-    (liftIO (getTime Monotonic))
-    (\t0 -> do
-       t <- liftIO (getTime Monotonic)
-       let delta = fromIntegral (toNanoSecs (t - t0)) * 1e-9
-       observe delta histogram)
-    (\_t0 -> m)
+  :: (MonadIO m, MonadMask m) => m a -> Histogram -> m a
+time m histogram = do
+  t0 <- liftIO (getTime Monotonic)
+  m `finally`
+    (do t <- liftIO (getTime Monotonic)
+        let delta = fromIntegral (toNanoSecs (t - t0)) * 1e-9
+        observe delta histogram)
 {-# INLINE time #-}
 
+instrumentRequests
+  :: (MonadIO m, MonadRegistry m)
+  => m Wai.Middleware
+instrumentRequests = do
+  httpRequestsTotal <-
+    newMetric
+      "http_requests_total"
+      "Total number of HTTP requests."
+      mempty
+      Counter
+  httpLatency <-
+    newMetric
+      "http_latency_seconds"
+      "Overall HTTP transaction latency."
+      mempty
+      (Histogram (exponentialBuckets 0.001 2 10))
+  return $ \app req res -> do
+    withMetric httpRequestsTotal incCounter
+    withMetric httpLatency $ time $ app req res
+
 countExceptions
-  :: IO a -> Counter -> IO a
+  :: (MonadIO m, MonadMask m)
+  => m a -> Counter -> m a
 countExceptions m c = m `onException` incCounter c
 {-# INLINE countExceptions #-}
 
-observe :: Double -> Histogram -> IO ()
-observe a@(D# a#) HistogramData {..} = do
+observe :: MonadIO m => Double -> Histogram -> m ()
+observe a@(D# a#) HistogramData {..} = liftIO $ do
   let i = V.findIndex (a <=) histogramBucketBounds
   seq i $
     modifyMVar_ histogramSumAndCount $ \(SumAndCount (# s, count #)) -> do
@@ -444,10 +467,7 @@ data AnyMetric where
 newtype Registry = Registry (Seq AnyMetric)
 
 newtype RegistryT m a = RegistryT (StateT Registry m a)
-  deriving (Functor, Applicative, Monad)
-
-newtype Unregistered a = Unregistered (RegistryT IO a)
-  deriving (Functor, Applicative, Monad)
+  deriving (Functor, Applicative, Monad, MonadIO)
 
 buildRegistry :: RegistryT m a -> m (a, Registry)
 buildRegistry (RegistryT s) = runStateT s (Registry mempty)
@@ -460,8 +480,8 @@ publishRegistryMiddleware path reg app req respond =
     else app req respond
 
 pushMetrics
-  :: MonadIO m
-  => Hostname -> Port -> ByteString -> Unregistered (Registry -> m ThreadId)
+  :: (MonadRegistry m, MonadIO n, MonadIO m)
+  => Hostname -> Port -> ByteString -> m (Registry -> n ThreadId)
 pushMetrics host port path = do
   let labels =
         StaticLabels
@@ -526,17 +546,23 @@ respondWithMetrics reg =
     outputRegistry reg emit
     flush
 
-toRegister
-  :: StreamMetric f
-  => StateT Registry IO (Metric f a) -> Unregistered (Metric f a)
-toRegister m = Unregistered $ RegistryT $ do
-  metric <- m
-  modify (\(Registry s) -> Registry (s |> AnyMetric metric))
-  return metric
-{-# INLINE toRegister #-}
+registerMetric
+  :: (MonadRegistry m, StreamMetric f)
+  => Metric f a -> m (Metric f a)
+registerMetric m =
+  register $
+  Unregistered $ do
+    modify (\(Registry s) -> Registry (s |> AnyMetric m))
+    return m
+{-# INLINE registerMetric #-}
 
-class Monad m => MonadPrometheus m where
+newtype Unregistered a = Unregistered (State Registry a)
+  deriving (Functor, Applicative, Monad)
+
+class Monad m => MonadRegistry m where
   register :: Unregistered a -> m a
 
-instance MonadIO m => MonadPrometheus (RegistryT m) where
-  register (Unregistered (RegistryT act)) = RegistryT (mapStateT liftIO act)
+instance Monad m =>
+         MonadRegistry (RegistryT m) where
+  register (Unregistered s) =
+    RegistryT (mapStateT (\(Identity a) -> return a) s)

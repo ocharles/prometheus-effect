@@ -15,7 +15,7 @@ data Metrics = Metrics { testCounter :: Metric Static Counter
 main :: IO ()
 main = do
   (Metrics {..}, _) <-
-    buildRegistry . register $
+    buildRegistry $
     Metrics <$> newMetric "counter" "" mempty Counter <*>
     newMetric "gauge" "" mempty Gauge <*>
     newMetric "histogram" "" mempty (Histogram (linearBuckets 0 1 10))
