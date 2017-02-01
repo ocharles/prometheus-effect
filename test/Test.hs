@@ -10,9 +10,10 @@ import Network.Wai.Handler.Warp
 import Prometheus
 import Prometheus.GHC
 import Network.HTTP.Types
+import Data.Text
 
 data Metrics = Metrics
-  { testcounter :: Counter
+  { testcounter :: Text -> IO Counter
   , testhistogram :: Histogram
   , testcounterTimer :: Histogram
   , testhistogramTimer :: Histogram
@@ -20,10 +21,18 @@ data Metrics = Metrics
 
 main :: IO ()
 main = do
-  ((Metrics {..}, pusher), registry) {- collectGHCStats, -}
-     <-
+  (launchStatsCollection, ghcStatsRegistry) <- buildRegistry ghcStats
+  launchStatsCollection
+  (launchPusher, pushRegistry) <-
+    buildRegistry (pushMetrics "localhost" 9091 "/metrics/job/j/instance/i")
+  (Metrics {..}, myRegistry) <-
     buildRegistry $ do
-      testcounter <- register "prom_test_counter" "Testing" mempty counter
+      testcounter <-
+        register
+          "prom_test_counter"
+          "Testing"
+          mempty
+          (addLabels "test_label" counter)
       testhistogram <-
         register
           "prom_test_histo"
@@ -42,14 +51,13 @@ main = do
           ""
           mempty
           (histogram (exponentialBuckets 1e-12 10 10))
-      -- collectGHCStats <- ghcStats
-      pusher <- pushMetrics "localhost" 9091 "/metrics/job/j/instance/i"
-      return (Metrics {..}, pusher) {- collectGHCStats, -}
-  -- collectGHCStats
-  pusher registry
+      return Metrics {..}
+  launchPusher (myRegistry <> ghcStatsRegistry <> pushRegistry)
   run 5811 $ \req respond
                   -- publishRegistryMiddleware ["metrics"] registry $ \req respond -> do
    -> do
-    time testcounterTimer $ incCounter testcounter
+    time testcounterTimer $ do
+      incCounter =<< testcounter "foo"
+      incCounter =<< testcounter "bar"
     time testhistogramTimer $ observe 1 testhistogram
     respond $ responseLBS status200 [] "Hello World"

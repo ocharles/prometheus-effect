@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -6,9 +7,11 @@
 module Prometheus
   ( -- * Creating & Registering Metrics
     register
+  , MetricName
+  , MetricHelp
   , Metric
   , addLabels
-
+  , Registry
     -- * Publishing Metrics
   , publishRegistryMiddleware
   , pushMetrics
@@ -42,21 +45,19 @@ module Prometheus
   , instrumentRequests
   ) where
 
-import Prelude hiding (sum)
 import Control.Applicative
-import Control.Exception.Safe (MonadMask, onException, finally)
 import Control.Concurrent (forkIO, threadDelay, ThreadId)
 import Control.Concurrent.MVar
-       (MVar, newMVar, modifyMVar, modifyMVar_, readMVar, withMVar)
+       (newMVar, modifyMVar, modifyMVar_, readMVar, withMVar)
+import Control.Exception.Safe (MonadMask, onException, finally)
 import Control.Monad (forever)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.Trans.State (StateT(..), runStateT)
+import Control.Monad.Trans.State.Strict (StateT(..), runStateT)
 import Control.Retry (recoverAll, capDelay, exponentialBackoff)
 import Data.ByteString (ByteString)
 import Data.ByteString.Builder (Builder, doubleDec)
 import Data.Foldable (for_)
-import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
-import Data.Int (Int64)
+import Data.IORef
 import Data.List (intersperse)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -66,23 +67,24 @@ import Data.Text (Text, pack)
 import Data.Text.Encoding (encodeUtf8Builder, decodeUtf8)
 import Data.Vector.Unboxed (Vector)
 import qualified Data.Vector.Unboxed as V
-import Data.Vector.Unboxed.Mutable (IOVector)
 import qualified Data.Vector.Unboxed.Mutable as MV
 import GHC.Float (Double(..))
+import qualified Network.HTTP.Types as HTTP
 import Network.Http.Client
        (withConnection, buildRequest, http, sendRequest, Method(POST),
         openConnection, Hostname, Port)
+import qualified Network.Wai as Wai
 import Numeric.Natural (Natural)
+import Prelude hiding (sum)
 import System.Clock
 import System.IO.Streams (write)
-import qualified Network.Wai as Wai
-import qualified Network.HTTP.Types as HTTP
 
 --------------------------------------------------------------------------------
 -- | 'Metric' describes a specific type of metric, but in an un-registered
 -- state. Pass 'Metric's to 'registerMetric' to construct the metric for
 -- operation.
-newtype Metric a = Metric (IO (a, IO [Sample]), MetricType)
+newtype Metric a =
+  Metric (IO (a, IO [Sample]), MetricType)
 
 class ToLabelMap a where
   toLabelMap :: a -> a -> Map Text Text
@@ -96,26 +98,29 @@ addLabels keys (Metric (io, t)) = Metric (dynamic, t)
     dynamic = do
       children <- newMVar mempty
       return (retrieveFrom children, sampleChildren children)
-    sampleChildren ref = do
-      children <- readMVar ref
-      Map.foldlWithKey'
-        (\m labels (_, sample) ->
-           liftA2
-             (++)
-             m
-             (fmap
-                (map (\s -> s {sampleLabels = sampleLabels s <> labels}))
-                sample))
-        (return [])
-        children
-    retrieveFrom ref values = do
-      modifyMVar ref $ \children -> do
-        let lbls = toLabelMap keys values
-        case Map.lookup lbls children of
-          Just (child, _) -> return (children, child)
-          Nothing -> do
-            (a, sample) <- io
-            return (Map.insert lbls (a, sample) children, a)
+      where
+        sampleChildren ref = do
+          children <- readMVar ref
+          Map.foldlWithKey'
+            (\m labels (_, sample) ->
+               liftA2
+                 (++)
+                 m
+                 (fmap
+                    (map (\s -> s {sampleLabels = sampleLabels s <> labels}))
+                    sample))
+            (return [])
+            children
+        retrieveFrom ref values = do
+          modifyMVar ref $ \children -> do
+            let lbls = toLabelMap keys values
+            case Map.lookup lbls children of
+              Just (child, _) -> do
+                return (children, child)
+              Nothing -> do
+                (a, sample) <- io
+                let !children' = Map.insert lbls (a, sample) children
+                return $! (children', a)
 
 --------------------------------------------------------------------------------
 -- Metric metadata
@@ -132,10 +137,11 @@ data Sample = Sample
   { sampleName :: !Text
   , sampleLabels :: !(Map Text Text)
   , sampleValue :: {-# UNPACK #-}!Double
-  }
+  } deriving (Show)
 
 --------------------------------------------------------------------------------
 newtype Registry = Registry (Map MetricName RegisteredMetric)
+  deriving (Monoid)
 
 data MetricType
   = TCounter
@@ -184,40 +190,42 @@ buildRegistry :: StateT Registry m a -> m (a, Registry)
 buildRegistry m = runStateT m (Registry mempty)
 
 --------------------------------------------------------------------------------
-newtype Counter = Counter (IORef Double)
+newtype Counter = Counter (Double -> IO ())
 
 counter :: Metric Counter
 counter =
   Metric
     ( do counterRef <- newIORef 0
          return
-           ( Counter counterRef
+           ( Counter (\d -> modifyIORef' counterRef (+ d))
            , pure . Sample "" mempty <$> readIORef counterRef)
     , TCounter)
 
-incCounter :: MonadIO m => Counter -> m ()
+incCounter :: Counter -> IO ()
 incCounter = flip incCounterBy 1
 {-# INLINE incCounter #-}
 
-incCounterBy :: MonadIO m => Counter -> Double -> m ()
-incCounterBy (Counter ioRef) delta = liftIO (modifyIORef' ioRef (+ delta))
+incCounterBy :: Counter -> Double -> IO ()
+incCounterBy (Counter f) = f
 {-# INLINE incCounterBy #-}
 
 countExceptions
-  :: (MonadIO m, MonadMask m)
-  => Counter -> m a -> m a
+  :: Counter -> IO a -> IO a
 countExceptions c m = m `onException` incCounter c
 {-# INLINE countExceptions #-}
 
 
 --------------------------------------------------------------------------------
-newtype Gauge = Gauge (IORef Double)
+newtype Gauge =
+  Gauge ((Double -> Double) -> IO ())
 
 gauge :: Metric Gauge
 gauge =
   Metric
     ( do ref <- newIORef 0
-         return (Gauge ref, pure . Sample "" mempty <$> readIORef ref)
+         return
+           ( Gauge (modifyIORef' ref)
+           , pure . Sample "" mempty <$> readIORef ref)
     , TCounter)
 
 incGauge :: MonadIO m => Gauge -> m ()
@@ -232,8 +240,8 @@ setGauge :: MonadIO m => Gauge -> Double -> m ()
 setGauge g = adjustGauge g . const
 {-# INLINE setGauge #-}
 
-adjustGauge :: MonadIO m => Gauge -> (Double -> Double) ->m ()
-adjustGauge (Gauge ioRef) f = liftIO (modifyIORef' ioRef f)
+adjustGauge :: MonadIO m => Gauge -> (Double -> Double) -> m ()
+adjustGauge (Gauge f) = liftIO . f
 {-# INLINE adjustGauge #-}
 
 
@@ -247,15 +255,7 @@ instance Monoid SumAndCount where
   mempty = SumAndCount 0 0
   SumAndCount a b `mappend` SumAndCount c d = SumAndCount (a + c) (b + d)
 
-data Histogram = Histogram
-  { histogramObservations :: {-# UNPACK #-} !(IOVector Int64)
-    -- ^ The count of observations in a given bucket. Bucket
-    -- upper-bounds correspond to 'histogramBucketBounds'.
-  , histogramBucketBounds :: {-# UNPACK #-} !(Vector Double)
-    -- ^ An ascending vector of inclusive upper-bounds.
-  , histogramSumAndCount :: {-# UNPACK #-} !(MVar SumAndCount)
-    -- ^ The total sum of all observed values.
-  }
+newtype Histogram = Histogram (Double -> IO ())
 
 newtype Buckets = Buckets (Vector Double)
 
@@ -282,47 +282,47 @@ exponentialBuckets start factor numBuckets
 histogram :: Buckets -> Metric Histogram
 histogram (Buckets v) =
   Metric
-    ( do counts <- MV.replicate (V.length v) 0
+    ( do counts <- MV.replicate (V.length v) (0 :: Double)
          sumAndCount <- newMVar mempty
-         let sample = do
-               (obs, SumAndCount {..}) <-
-                 withMVar sumAndCount $ \sumCount -> do
-                   obs <- V.freeze counts
-                   return (obs, sumCount)
-               let countSamples =
-                     V.ifoldl'
-                       (\xs i n ->
-                          Sample
-                            ""
-                            (Map.singleton "le" (pack (show (v V.! i))))
-                            (fromIntegral n) :
-                          xs)
-                       []
-                       (V.postscanl' (+) 0 obs)
-                   sumSample = Sample "_sum" mempty sum
-                   countSample = Sample "_count" mempty count
-               return (sumSample : countSample : countSamples)
-         return (Histogram counts v sumAndCount, sample)
+         return
+           ( Histogram (observeImpl sumAndCount counts)
+           , sample sumAndCount counts)
     , THistogram)
+  where
+    observeImpl sumAndCount observations a = do
+      let i = V.findIndex (a <=) v
+      seq i $
+        modifyMVar_ sumAndCount $ \(SumAndCount s count) -> do
+          for_ i (MV.unsafeModify observations succ)
+          return $! SumAndCount (s + a) (count + 1)
+    sample sumAndCount observations = do
+      (obs, SumAndCount {..}) <-
+        withMVar sumAndCount $ \sumCount -> do
+          obs <- V.freeze observations
+          return (obs, sumCount)
+      let countSamples =
+            V.ifoldl'
+              (\xs i n ->
+                 Sample "" (Map.singleton "le" (pack (show (v V.! i)))) n : xs)
+              []
+              (V.postscanl' (+) 0 obs)
+          sumSample = Sample "_sum" mempty sum
+          countSample = Sample "_count" mempty count
+      return (sumSample : countSample : countSamples)
 
 observe :: MonadIO m => Double -> Histogram -> m ()
-observe a Histogram{..} = liftIO $ do
-  let i = V.findIndex (a <=) histogramBucketBounds
-  seq i $
-    modifyMVar_ histogramSumAndCount $ \(SumAndCount s count) -> do
-      for_ i (MV.unsafeModify histogramObservations succ)
-      return $! SumAndCount (s + a) (count + 1)
+observe a (Histogram f) = liftIO (f a)
 {-# INLINE observe #-}
 
 time
   :: (MonadIO m, MonadMask m)
   => Histogram -> m a -> m a
-time histogram m = do
+time h m = do
   t0 <- liftIO (getTime Monotonic)
   m `finally`
     (do t <- liftIO (getTime Monotonic)
         let delta = fromIntegral (toNanoSecs (t - t0)) * 1e-9
-        observe delta histogram)
+        observe delta h)
 {-# INLINE time #-}
 
 
@@ -433,7 +433,7 @@ instrumentRequests = do
       "http_latency_seconds"
       "Overall HTTP transaction latency."
       mempty
-      (histogram (exponentialBuckets 0.001 2 10))
+      (histogram (exponentialBuckets 0.001 5 10))
   return $ \app req res -> do
     incCounter httpRequestsTotal
     time httpLatency $ app req res
