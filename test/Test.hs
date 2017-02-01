@@ -24,7 +24,7 @@ main = do
   (launchStatsCollection, ghcStatsRegistry) <- buildRegistry ghcStats
   launchStatsCollection
   (launchPusher, pushRegistry) <-
-    buildRegistry (pushMetrics "localhost" 9091 "/metrics/job/j/instance/i")
+    buildRegistry (pushMetrics "http://localhost:9091/metrics/job/j/instance/i")
   (Metrics {..}, myRegistry) <-
     buildRegistry $ do
       testcounter <-
@@ -52,12 +52,12 @@ main = do
           mempty
           (histogram (exponentialBuckets 1e-12 10 10))
       return Metrics {..}
-  launchPusher (myRegistry <> ghcStatsRegistry <> pushRegistry)
-  run 5811 $ \req respond
-                  -- publishRegistryMiddleware ["metrics"] registry $ \req respond -> do
-   -> do
-    time testcounterTimer $ do
-      incCounter =<< testcounter "foo"
-      incCounter =<< testcounter "bar"
-    time testhistogramTimer $ observe 1 testhistogram
-    respond $ responseLBS status200 [] "Hello World"
+  let registry = myRegistry <> ghcStatsRegistry <> pushRegistry
+  launchPusher registry
+  run 5811 $
+    publishRegistryMiddleware ["metrics"] registry $ \req respond -> do
+      time testcounterTimer $ do
+        incCounter =<< testcounter "foo"
+        incCounter =<< testcounter "bar"
+      time testhistogramTimer $ observe 1 testhistogram
+      respond $ responseLBS status200 [] "Hello World"

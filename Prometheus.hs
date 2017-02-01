@@ -37,7 +37,7 @@ module Prometheus
   , Histogram
   , histogram
   , Buckets
-  , linearBuckets, exponentialBuckets
+  , linearBuckets, exponentialBuckets, ioDurationBuckets, mkBuckets
   , observe
   , time
 
@@ -57,7 +57,7 @@ import Data.ByteString (ByteString)
 
 import qualified Data.ByteString.Streaming as S (fromChunks)
 import qualified Data.ByteString.Streaming.HTTP as HTTP
-import Data.Foldable (for_)
+import Data.Foldable (for_, toList)
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as Map
 import Data.Hashable
@@ -67,6 +67,7 @@ import Data.Monoid ((<>))
 import Data.String (IsString)
 import Data.Text (Text, pack, unpack)
 import Data.Text.Encoding (encodeUtf8)
+import qualified Data.Vector.Algorithms.Merge as V
 import Data.Vector.Unboxed (Vector)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
@@ -79,7 +80,6 @@ import Prelude hiding (sum)
 import Streaming (Stream, Of)
 import qualified Streaming.Prelude as S
 import System.Clock
-
 
 --------------------------------------------------------------------------------
 -- | 'Metric' describes a specific type of metric, but in an un-registered
@@ -258,14 +258,20 @@ newtype Histogram = Histogram (Double -> IO ())
 
 newtype Buckets = Buckets (Vector Double)
 
+instance Monoid Buckets where
+  mempty = Buckets mempty
+  Buckets a `mappend` Buckets b = Buckets (V.modify V.sort (a <> b))
+
+mkBuckets :: Foldable f => f Double -> Buckets
+mkBuckets =
+  Buckets . V.modify V.sort . V.fromList . filter (/= read "Infinity") . toList
+
 -- | @linearBuckets start width numBuckets@ creates @numBuckets@ buckets, each
 -- @width@ wide, where the lowest bucket has an upper bound of @start@
 -- (assuming @width@ is positive).
 linearBuckets :: Double -> Double -> Natural -> Buckets
 linearBuckets start width numBuckets =
-  Buckets
-    (V.prescanl' (+) start (V.replicate (fromIntegral numBuckets) width) <>
-     V.singleton (read "Infinity"))
+  Buckets (V.prescanl' (+) start (V.replicate (fromIntegral numBuckets) width))
 
 -- @exponentialBuckets @start factor numBuckets@ creates @numBuckets@ buckets,
 -- where the lowest bucket has an upper bound of @start@ and each following
@@ -274,12 +280,19 @@ exponentialBuckets :: Double -> Double -> Natural -> Buckets
 exponentialBuckets start factor numBuckets
   | start > 0 && factor > 1 =
     Buckets
-      (V.prescanl' (*) start (V.replicate (fromIntegral numBuckets) factor) <>
-       V.singleton (read "Infinity"))
+      (V.prescanl' (*) start (V.replicate (fromIntegral numBuckets) factor))
   | otherwise = error "Invalid arguments"
 
+-- | Pre-defined buckets that are probably suitable for IO operations.
+-- Upper-bounds are: 1μs, 10μs, 100μs, 1ms, 10ms, 100ms, 200ms, 300ms,
+-- 400ms, 500ms, 600ms, 700ms, 800ms, 900ms, 1s, 2s, 4s, 8s, 16s.
+ioDurationBuckets :: Buckets
+ioDurationBuckets =
+  exponentialBuckets 1e-6 10 5 <> linearBuckets 0.1 0.1 9 <>
+  exponentialBuckets 1 2 5
+
 histogram :: Buckets -> Metric Histogram
-histogram (Buckets v) =
+histogram buckets =
   Metric
     ( do counts <- MV.replicate (V.length v) (0 :: Double)
          sumAndCount <- newMVar mempty
@@ -288,6 +301,9 @@ histogram (Buckets v) =
            , sample sumAndCount counts)
     , THistogram)
   where
+    v =
+      case buckets of
+        Buckets v' -> v' <> V.singleton (read "Infinity")
     observeImpl sumAndCount observations a = do
       let i = V.findIndex (a <=) v
       seq i $
@@ -339,7 +355,7 @@ pushMetrics endpoint = do
       "haskell_prometheus_push_latency_seconds"
       "The latency when pushing metrics to a Pushgateway"
       labels
-      (histogram (exponentialBuckets 1e-6 10 7))
+      (histogram ioDurationBuckets)
   pushInterval <-
     register
       "haskell_prometheus_push_interval_seconds"
@@ -425,7 +441,7 @@ instrumentRequests = do
       "http_latency_seconds"
       "Overall HTTP transaction latency."
       mempty
-      (histogram (exponentialBuckets 0.001 5 10))
+      (histogram ioDurationBuckets)
   return $ \app req res -> do
     incCounter httpRequestsTotal
     time httpLatency $ app req res

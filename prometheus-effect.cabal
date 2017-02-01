@@ -29,6 +29,7 @@ library
                      , transformers
                      , unordered-containers
                      , vector >= 0.11.0.0
+                     , vector-algorithms
                      , wai
   default-language:    Haskell2010
   -- Use -O2 for a 50% performance increase in observe
