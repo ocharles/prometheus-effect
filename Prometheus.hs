@@ -45,7 +45,6 @@ module Prometheus
   , instrumentRequests
   ) where
 
-import Control.Applicative
 import Control.Concurrent (forkIO, threadDelay, ThreadId)
 import Control.Concurrent.MVar
        (newMVar, modifyMVar, modifyMVar_, readMVar, withMVar)
@@ -55,7 +54,9 @@ import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.State.Strict (StateT(..), runStateT)
 import Control.Retry (recoverAll, capDelay, exponentialBackoff)
 import Data.ByteString (ByteString)
-import Data.ByteString.Builder (Builder, doubleDec)
+
+import qualified Data.ByteString.Streaming as S (fromChunks)
+import qualified Data.ByteString.Streaming.HTTP as HTTP
 import Data.Foldable (for_)
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as Map
@@ -64,28 +65,28 @@ import Data.IORef
 import Data.List (intersperse)
 import Data.Monoid ((<>))
 import Data.String (IsString)
-import Data.Text (Text, pack)
-import Data.Text.Encoding (encodeUtf8Builder, decodeUtf8)
+import Data.Text (Text, pack, unpack)
+import Data.Text.Encoding (encodeUtf8)
 import Data.Vector.Unboxed (Vector)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
 import GHC.Float (Double(..))
 import qualified Network.HTTP.Types as HTTP
-import Network.Http.Client
-       (withConnection, buildRequest, http, sendRequest, Method(POST),
-        openConnection, Hostname, Port)
 import qualified Network.Wai as Wai
+import Network.Wai.Streaming (streamingResponse)
 import Numeric.Natural (Natural)
 import Prelude hiding (sum)
+import Streaming (Stream, Of)
+import qualified Streaming.Prelude as S
 import System.Clock
-import System.IO.Streams (write)
+
 
 --------------------------------------------------------------------------------
 -- | 'Metric' describes a specific type of metric, but in an un-registered
 -- state. Pass 'Metric's to 'registerMetric' to construct the metric for
 -- operation.
 newtype Metric a =
-  Metric (IO (a, IO [Sample]), MetricType)
+  Metric (IO (a, Stream (Of Sample) IO ()), MetricType)
 
 class ToLabelMap a where
   toLabelMap :: a -> a -> HashMap Text Text
@@ -99,29 +100,27 @@ addLabels keys (Metric (io, t)) = Metric (dynamic, t)
     dynamic = do
       children <- newMVar mempty
       return (retrieveFrom children, sampleChildren children)
-      where
-        sampleChildren ref = do
-          children <- readMVar ref
-          Map.foldlWithKey'
-            (\m labels (_, sample) ->
-               liftA2
-                 (++)
-                 m
-                 (fmap
-                    (map (\s -> s {sampleLabels = sampleLabels s <> labels}))
-                    sample))
-            (return [])
-            children
-        retrieveFrom ref values = do
-          modifyMVar ref $ \children -> do
-            let lbls = toLabelMap keys values
-            case Map.lookup lbls children of
-              Just (child, _) -> do
-                return (children, child)
-              Nothing -> do
-                (a, sample) <- io
-                let !children' = Map.insert lbls (a, sample) children
-                return $! (children', a)
+    sampleChildren ref = do
+      children <- liftIO (readMVar ref)
+      Map.foldlWithKey'
+        (\out labels (_, samples) -> do
+           () <-
+             S.map
+               (\sample -> sample {sampleLabels = sampleLabels sample <> labels})
+               samples
+           out)
+        (return ())
+        children
+    retrieveFrom ref values = do
+      modifyMVar ref $ \children -> do
+        let lbls = toLabelMap keys values
+        case Map.lookup lbls children of
+          Just (child, _) -> do
+            return (children, child)
+          Nothing -> do
+            (a, sample) <- io
+            let !children' = Map.insert lbls (a, sample) children
+            return $! (children', a)
 
 --------------------------------------------------------------------------------
 -- Metric metadata
@@ -152,7 +151,7 @@ data MetricType
 data RegisteredMetric = RegisteredMetric
   { metricHelp :: {-# UNPACK #-} !MetricHelp
   , metricType :: !MetricType
-  , metricSample :: IO [Sample]
+  , metricSample :: Stream (Of Sample) IO ()
   }
 
 data RegistrationFailure = MetricCollision
@@ -180,9 +179,8 @@ register name help labels (Metric (constructor, t)) =
                   { metricHelp = help
                   , metricType = t
                   , metricSample =
-                      (fmap
-                         (map
-                            (\s -> s {sampleLabels = sampleLabels s <> labels}))
+                      (S.map
+                         (\s -> s {sampleLabels = sampleLabels s <> labels})
                          sample)
                   })
                  registered))
@@ -199,7 +197,7 @@ counter =
     ( do counterRef <- newIORef 0
          return
            ( Counter (\d -> modifyIORef' counterRef (+ d))
-           , pure . Sample "" mempty <$> readIORef counterRef)
+           , liftIO (readIORef counterRef) >>= S.yield . Sample "" mempty)
     , TCounter)
 
 incCounter :: Counter -> IO ()
@@ -226,7 +224,7 @@ gauge =
     ( do ref <- newIORef 0
          return
            ( Gauge (modifyIORef' ref)
-           , pure . Sample "" mempty <$> readIORef ref)
+           , liftIO (readIORef ref) >>= S.yield . Sample "" mempty)
     , TCounter)
 
 incGauge :: MonadIO m => Gauge -> m ()
@@ -298,18 +296,21 @@ histogram (Buckets v) =
           return $! SumAndCount (s + a) (count + 1)
     sample sumAndCount observations = do
       (obs, SumAndCount {..}) <-
+        liftIO $
         withMVar sumAndCount $ \sumCount -> do
           obs <- V.freeze observations
           return (obs, sumCount)
       let countSamples =
-            V.ifoldl'
-              (\xs i n ->
-                 Sample "" (Map.singleton "le" (pack (show (v V.! i)))) n : xs)
-              []
+            V.imapM_
+              (\i n ->
+                 S.yield
+                   (Sample "" (Map.singleton "le" (pack (show (v V.! i)))) n))
               (V.postscanl' (+) 0 obs)
           sumSample = Sample "_sum" mempty sum
           countSample = Sample "_count" mempty count
-      return (sumSample : countSample : countSamples)
+      S.yield sumSample
+      S.yield countSample
+      countSamples
 
 observe :: MonadIO m => Double -> Histogram -> m ()
 observe a (Histogram f) = liftIO (f a)
@@ -329,17 +330,10 @@ time h m = do
 
 --------------------------------------------------------------------------------
 pushMetrics
-  :: Hostname
-  -> Port
-  -> ByteString
-  -> StateT Registry IO (Registry -> IO ThreadId)
-pushMetrics host port path = do
-  let labels =
-        Map.fromList
-          [ ("host", decodeUtf8 host)
-          , ("port", pack (show port))
-          , ("path", decodeUtf8 "path")
-          ]
+  :: MonadIO m
+  => Text -> StateT Registry IO (Registry -> m ThreadId)
+pushMetrics endpoint = do
+  let labels = Map.fromList [("endpoint", endpoint)]
   pushLatency <-
     register
       "haskell_prometheus_push_latency_seconds"
@@ -360,19 +354,21 @@ pushMetrics host port path = do
       counter
   return $ \reg ->
     liftIO $
-    forkIO $ do
-      req <- buildRequest $ http POST path
-      recoverAll (capDelay 60000000 $ exponentialBackoff 500000) $ \_ ->
-        countExceptions pushExceptions $
-        withConnection (openConnection host port) $ \c ->
-          forever $
+    forkIO $
+    recoverAll (capDelay 60000000 $ exponentialBackoff 500000) $ \_ ->
+      countExceptions pushExceptions $ do
+        m <- HTTP.newManager HTTP.tlsManagerSettings
+        req <- HTTP.parseRequest (unpack endpoint)
+        let req' =
+              req
+              { HTTP.method = "POST"
+              , HTTP.requestBody =
+                  HTTP.stream (S.fromChunks (streamRegistry reg))
+              }
+        forever $
           time pushInterval $ do
             t0 <- getTime Monotonic
-            time pushLatency $
-              sendRequest
-                c
-                req
-                (\out -> writeRegistry reg (\b -> write (Just b) out))
+            time pushLatency $ HTTP.withHTTP req' m $ \_resp -> return ()
             t <- getTime Monotonic
             let delta = fromIntegral (toNanoSecs (t - t0)) * 1e-3 :: Double
                 delay = round (5e6 - delta)
@@ -380,43 +376,38 @@ pushMetrics host port path = do
 
 
 --------------------------------------------------------------------------------
-writeRegistry :: Registry -> (Builder -> IO ()) -> IO ()
-writeRegistry (Registry reg) emit = do
+streamRegistry :: Registry -> Stream (Of ByteString) IO ()
+streamRegistry (Registry reg) =
+  S.map encodeUtf8 $
   Map.foldlWithKey'
-    (\m k v -> do
-       writeMetric emit k v
-       emit "\n"
-       m)
+    (\stream k v -> do
+       streamMetric k v
+       stream)
     (return ())
     reg
-  emit "\n"
 
-writeMetric :: (Builder -> IO ()) -> MetricName -> RegisteredMetric -> IO ()
-writeMetric out (MetricName metricName) RegisteredMetric { metricHelp = MetricHelp metricHelp
-                                                         , metricType = t
-                                                         , ..
-                                                         } = do
-  let nameBuilder = encodeUtf8Builder metricName
-  out ("# HELP " <> nameBuilder <> " " <> encodeUtf8Builder metricHelp <> "\n")
-  out ("# TYPE " <> nameBuilder <> " " <> encodeMetricType t <> "\n")
-  samples <- metricSample
-  for_ samples $ \Sample {..} ->
-    out
-      (nameBuilder <> encodeUtf8Builder sampleName <> encodeLabels sampleLabels <>
-       " " <>
-       doubleDec sampleValue <>
-       "\n")
+streamMetric :: MetricName -> RegisteredMetric -> Stream (Of Text) IO ()
+streamMetric (MetricName metricName) RegisteredMetric { metricHelp = MetricHelp metricHelp
+                                                      , metricType = t
+                                                      , ..
+                                                      } = do
+  S.yield ("# HELP " <> metricName <> " " <> metricHelp <> "\n")
+  S.yield ("# TYPE " <> metricName <> " " <> metricTypeText t <> "\n")
+  S.map sampleToText metricSample
   where
-    encodeMetricType TCounter = "counter"
-    encodeMetricType TGauge = "gauge"
-    encodeMetricType THistogram = "histogram"
-    encodeLabels m
+    sampleToText Sample {..} =
+      metricName <> sampleName <> labelsToText sampleLabels <> " " <>
+      pack (show sampleValue) <> "\n"
+    metricTypeText TCounter = "counter"
+    metricTypeText TGauge = "gauge"
+    metricTypeText THistogram = "histogram"
+    labelsToText m
       | Map.null m = ""
       | otherwise =
-        "{" <> mconcat (intersperse "," (fmap buildLabelPair (Map.toList m))) <>
+        "{" <> mconcat (intersperse "," (fmap labelPairText (Map.toList m))) <>
         "}"
-    buildLabelPair (k, v) =
-      encodeUtf8Builder k <> "=\"" <> encodeUtf8Builder v <> "\""
+    labelPairText (k, v) =
+      k <> "=\"" <> v <> "\""
 
 
 --------------------------------------------------------------------------------
@@ -449,7 +440,4 @@ publishRegistryMiddleware path reg app req respond =
     else app req respond
 
 respondWithMetrics :: Registry -> Wai.Response
-respondWithMetrics reg =
-  Wai.responseStream HTTP.status200 [] $ \emit flush -> do
-    writeRegistry reg emit
-    flush
+respondWithMetrics reg = streamingResponse (streamRegistry reg) HTTP.status200 []

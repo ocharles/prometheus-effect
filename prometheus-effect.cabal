@@ -22,6 +22,9 @@ library
                      , retry
                      , safe-exceptions
                      , streaming
+                     , streaming-wai
+                     , streaming-bytestring
+                     , streaming-utils
                      , text
                      , transformers
                      , unordered-containers
