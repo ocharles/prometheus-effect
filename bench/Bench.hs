@@ -1,6 +1,7 @@
 {-# LANGUAGE RecordWildCards, OverloadedStrings #-}
 module Main where
 
+import Control.Monad
 import Control.Concurrent
 import Criterion
 import Criterion.Main
@@ -31,17 +32,17 @@ main = do
   threadDelay 10000
   putStrLn "Running benchmarks:"
   defaultMainWith defaultConfig $
-    [ bgroup
-        "Noop metrics"
-        [bench "incCounter" (nfIO (incCounter (aCounter noopMetrics)))
-        ,bench "incGauge" (nfIO (incGauge (aGauge noopMetrics)))
-        ,bench "observe" (nfIO (observe 9 (aHistogram noopMetrics)))
-        ]
-    , bgroup
-        "Metrics"
-        [bench "incCounter" (nfIO (incCounter (aCounter metrics)))
-        ,bench "incGauge" (nfIO (incGauge (aGauge metrics)))
-        ,bench "observe" (nfIO (observe 9 (aHistogram metrics)))
-        ]
+    [ makeBenchmarks "noop" noopMetrics
+    , makeBenchmarks "registered" metrics
     ]
   seq retainedRegistry (return ())
+
+makeBenchmarks groupLabel Metrics {..} =
+  bgroup
+    groupLabel
+    [ bench "incCounter" (nfIO (replicateM_ n $ incCounter aCounter))
+    , bench "incGauge" (nfIO (replicateM_ n $ incGauge aGauge))
+    , bench "observe" (nfIO (replicateM_ n $ observe 9 aHistogram))
+    ]
+  where
+    n = 10000
