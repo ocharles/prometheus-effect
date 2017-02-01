@@ -1,7 +1,7 @@
-{ mkDerivation, base, bytestring, clock, containers, ghc-prim
-, http-streams, http-types, io-streams, labels, mtl, random, retry
-, safe-exceptions, scientific, stdenv, text, transformers, vector
-, vector-algorithms, wai, warp, weigh
+{ mkDerivation, base, bytestring, clock, hashable, http-streams
+, http-types, io-streams, mtl, random, retry, safe-exceptions
+, stdenv, streaming, text, transformers, unordered-containers
+, vector, wai, warp, weigh
 }:
 mkDerivation {
   pname = "prometheus-effect";
@@ -10,11 +10,13 @@ mkDerivation {
   isLibrary = true;
   isExecutable = true;
   libraryHaskellDepends = [
-    base bytestring clock containers ghc-prim http-streams http-types
-    io-streams labels mtl retry safe-exceptions scientific text
-    transformers vector vector-algorithms wai
+    base bytestring clock hashable http-streams http-types io-streams
+    mtl retry safe-exceptions streaming text transformers
+    unordered-containers vector wai
   ];
-  executableHaskellDepends = [ base http-types random wai warp ];
-  testHaskellDepends = [ base weigh ];
+  executableHaskellDepends = [
+    base http-types random text wai warp
+  ];
+  testHaskellDepends = [ base text weigh ];
   license = stdenv.lib.licenses.bsd3;
 }

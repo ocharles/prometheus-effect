@@ -12,23 +12,21 @@ library
   exposed-modules:     Prometheus
                        Prometheus.GHC
   build-depends:       base >=4.9 && <4.11
-                     , clock
-                     , containers
-                     , http-types >= 0.9.1
-                     , labels
-                     , mtl
-                     , scientific
-                     , text
-                     , transformers
-                     , vector >= 0.11.0.0
-                     , vector-algorithms
-                     , wai
                      , bytestring
+                     , clock
+                     , hashable >= 1.2.4.0
                      , http-streams
+                     , http-types >= 0.9.1
                      , io-streams
-                     , ghc-prim
+                     , mtl
                      , retry
                      , safe-exceptions
+                     , streaming
+                     , text
+                     , transformers
+                     , unordered-containers
+                     , vector >= 0.11.0.0
+                     , wai
   default-language:    Haskell2010
   -- Use -O2 for a 50% performance increase in observe
   ghc-options:         -Wall -O2

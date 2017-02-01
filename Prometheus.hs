@@ -57,10 +57,11 @@ import Control.Retry (recoverAll, capDelay, exponentialBackoff)
 import Data.ByteString (ByteString)
 import Data.ByteString.Builder (Builder, doubleDec)
 import Data.Foldable (for_)
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as Map
+import Data.Hashable
 import Data.IORef
 import Data.List (intersperse)
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
 import Data.Monoid ((<>))
 import Data.String (IsString)
 import Data.Text (Text, pack)
@@ -87,7 +88,7 @@ newtype Metric a =
   Metric (IO (a, IO [Sample]), MetricType)
 
 class ToLabelMap a where
-  toLabelMap :: a -> a -> Map Text Text
+  toLabelMap :: a -> a -> HashMap Text Text
 
 instance ToLabelMap Text where
   toLabelMap k v = Map.singleton k v
@@ -126,7 +127,7 @@ addLabels keys (Metric (io, t)) = Metric (dynamic, t)
 -- Metric metadata
 
 newtype MetricName = MetricName Text
-  deriving (Ord, Eq, IsString)
+  deriving (Ord, Eq, IsString, Hashable)
 
 newtype MetricHelp = MetricHelp Text
   deriving (IsString)
@@ -135,12 +136,12 @@ newtype MetricHelp = MetricHelp Text
 --------------------------------------------------------------------------------
 data Sample = Sample
   { sampleName :: !Text
-  , sampleLabels :: !(Map Text Text)
+  , sampleLabels :: !(HashMap Text Text)
   , sampleValue :: {-# UNPACK #-}!Double
   } deriving (Show)
 
 --------------------------------------------------------------------------------
-newtype Registry = Registry (Map MetricName RegisteredMetric)
+newtype Registry = Registry (HashMap MetricName RegisteredMetric)
   deriving (Monoid)
 
 data MetricType
@@ -161,7 +162,7 @@ data RegistrationFailure = MetricCollision
 register
   :: MetricName
   -> MetricHelp
-  -> Map Text Text
+  -> HashMap Text Text
   -> Metric a
   -> StateT Registry IO a
 register name help labels (Metric (constructor, t)) =
