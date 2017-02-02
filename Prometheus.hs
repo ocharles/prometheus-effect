@@ -94,7 +94,9 @@ class ToLabelMap a where
 instance ToLabelMap Text where
   toLabelMap k v = Map.singleton k v
 
-addLabels :: ToLabelMap a => a -> Metric m -> Metric (a -> IO m)
+addLabels
+  :: ToLabelMap a
+  => a -> Metric metric -> Metric (a -> IO metric)
 addLabels keys (Metric (io, t)) = Metric (dynamic, t)
   where
     dynamic = do
@@ -200,16 +202,16 @@ counter =
            , liftIO (readIORef counterRef) >>= S.yield . Sample "" mempty)
     , TCounter)
 
-incCounter :: Counter -> IO ()
+incCounter :: MonadIO m => Counter -> m ()
 incCounter = flip incCounterBy 1
 {-# INLINE incCounter #-}
 
-incCounterBy :: Counter -> Double -> IO ()
-incCounterBy (Counter f) = f
+incCounterBy :: MonadIO m => Counter -> Double -> m ()
+incCounterBy (Counter f) = liftIO . f
 {-# INLINE incCounterBy #-}
 
 countExceptions
-  :: Counter -> IO a -> IO a
+  :: (MonadMask m, MonadIO m) => Counter -> m a -> m a
 countExceptions c m = m `onException` incCounter c
 {-# INLINE countExceptions #-}
 
