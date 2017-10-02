@@ -30,28 +30,33 @@ extensions just to bump a counter!
 Here's one example to demonstrate how you could use this library:
 
 @
+\{\-# LANGUAGE OverloadedStrings \#\-\}
 \{\-# LANGUAGE RecordWildCards \#\-\}
 
 import Control.Concurrent
-import qualified Network.Wai.Handler.Warp as Warp
+import Control.Monad
+import Network.HTTP.Types.Status
 import "Prometheus"
 import System.Random
+import qualified Network.Wai as Wai
+import qualified Network.Wai.Handler.Warp as Warp
 
 data Metrics = Metrics
   { iterations :: 'Counter'
-  , timePerLoop :: 'Counter'
+  , timePerLoop :: 'Histogram'
   }
 
 main :: IO ()
 main = do
   (metrics, registry) <- 'buildRegistry' $ do
-    iterations <- 'register' "iterations" "Total completed iterations" mempty 'counter'
+    iterations <- 'register' "iterations" "Total completed iterations" mempty counter
     timePerLoop <- 'register' "time_per_loop" "Distribution of time per loop" mempty ('histogram' 'ioDurationBuckets')
+    return Metrics{..}
 
   forkIO $ Warp.run 8000 $ 'publishRegistryMiddleware' ["metrics"] registry $ \\req mkRes ->
-    Warp.mkRes (Warp.responseLBS 404 mempty mempty)
+    mkRes (Wai.responseLBS notFound404 mempty mempty)
 
-  forever $ time ('timePerLoop' metrics) $ do
+  forever $ 'time' (timePerLoop metrics) $ do
     threadDelay =<< randomIO
     'incCounter' (iterations metrics)
 @
