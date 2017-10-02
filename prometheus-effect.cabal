@@ -24,6 +24,7 @@ maintainer:          ollie@ocharles.org.uk
 build-type:          Simple
 extra-source-files:  ChangeLog.md
 cabal-version:       >=1.10
+homepage: https://github.com/ocharles/prometheus-effect
 
 library
   exposed-modules:     Prometheus
