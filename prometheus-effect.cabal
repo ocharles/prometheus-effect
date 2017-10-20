@@ -34,9 +34,7 @@ library
                      , bytestring
                      , clock
                      , hashable >= 1.2.4.0
-                     , http-streams
                      , http-types >= 0.9.1
-                     , io-streams
                      , mtl
                      , retry
                      , safe-exceptions
@@ -75,7 +73,6 @@ test-suite weight
 benchmark benchmarks
   hs-source-dirs:      bench
   build-depends:       base
-                     , weigh
                      , criterion
                      , prometheus-effect
                      , text

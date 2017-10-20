@@ -23,7 +23,7 @@ main = do
     Metrics <$> register "counter" "" mempty counter <*>
     register "gauge" "" mempty gauge <*>
     register "histogram" "" mempty (histogram (linearBuckets 0 1 10))
-    <*> register "dyn" "" mempty (addLabels "k" counter)
+    <*> register "dyn" "" mempty (addLabel "k" counter)
   performGC
   threadDelay 10000
   incCounter testCounter
