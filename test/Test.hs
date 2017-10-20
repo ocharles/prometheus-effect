@@ -32,7 +32,7 @@ main = do
           "prom_test_counter"
           "Testing"
           mempty
-          (addLabels "test_label" counter)
+          (addLabel "test_label" counter)
       testhistogram <-
         register
           "prom_test_histo"
