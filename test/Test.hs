@@ -1,16 +1,17 @@
 {-# LANGUAGE ApplicativeDo, RecordWildCards, OverloadedStrings #-}
 module Main where
 
-import System.Random
-import Control.Concurrent
 import Control.Applicative
+import Control.Concurrent
+import Data.Foldable
 import Data.Monoid
+import Data.Text
+import Network.HTTP.Types
 import Network.Wai
 import Network.Wai.Handler.Warp
 import Prometheus
 import Prometheus.GHC
-import Network.HTTP.Types
-import Data.Text
+import System.Random
 
 data Metrics = Metrics
   { testcounter :: Text -> IO Counter
@@ -22,7 +23,7 @@ data Metrics = Metrics
 main :: IO ()
 main = do
   (launchStatsCollection, ghcStatsRegistry) <- buildRegistry ghcStats
-  launchStatsCollection
+  for_ launchStatsCollection id
   (launchPusher, pushRegistry) <-
     buildRegistry (pushMetrics "http://localhost:9091/metrics/job/j/instance/i")
   (Metrics {..}, myRegistry) <-

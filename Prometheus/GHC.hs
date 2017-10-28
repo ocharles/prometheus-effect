@@ -7,6 +7,7 @@ import Control.Concurrent
 import Control.Monad (forever)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State (MonadState)
+import Control.Retry
 import Data.Monoid (mempty)
 import qualified GHC.Stats as GHC
 import Prometheus
@@ -48,8 +49,18 @@ The following metrics will be registered:
 * @ghc_prometheus_collection_time_seconds@: Amount of time spent by the Prometheus library collecting GHC statistics
 * @ghc_prometheus_record_time_seconds@: Amount of time spent by the Prometheus library recording GHC statistics
 -}
-ghcStats :: (MonadState Registry m, MonadIO m) =>  m (IO ThreadId)
+ghcStats :: (MonadState Registry m, MonadIO m) =>  m (Maybe (IO ThreadId))
 ghcStats = do
+  enabled <- liftIO GHC.getGCStatsEnabled
+  case enabled of
+    False -> do
+      liftIO $ putStrLn "GHC Statisics are not enabled."
+      return Nothing
+    True ->
+      fmap Just mkGhcStats
+
+mkGhcStats :: (MonadState Registry m, MonadIO m) =>  m (IO ThreadId)
+mkGhcStats = do
   bytesAllocated <-
     newUnlabelledMetric
       "ghc_bytes_allocated_total"
@@ -151,45 +162,40 @@ ghcStats = do
       "Amount of time spent by the Prometheus library recording GHC statistics"
       (histogram (exponentialBuckets 1e-12 10 10))
   return $
-    liftIO $
-    forkIO $ do
-      enabled <- GHC.getGCStatsEnabled
-      case enabled of
-        False -> putStrLn "GHC Statisics are not enabled."
-        True ->
-          forever $ do
-            stats <- time ghcStatsTime GHC.getGCStats
-            time ghcRecordTime $ do
-              setGauge bytesAllocated (fromIntegral $ GHC.bytesAllocated stats)
-              setGauge numGcs (fromIntegral $ GHC.numGcs stats)
-              setGauge maxBytesUsed (fromIntegral $ GHC.maxBytesUsed stats)
-              setGauge
-                numByteUsageSamples
-                (fromIntegral $ GHC.numByteUsageSamples stats)
-              setGauge
-                cumulativeBytesUsed
-                (fromIntegral $ GHC.cumulativeBytesUsed stats)
-              setGauge bytesCopied (fromIntegral $ GHC.bytesCopied stats)
-              setGauge
-                currentBytesUsed
-                (fromIntegral $ GHC.currentBytesUsed stats)
-              setGauge
-                currentBytesSlop
-                (fromIntegral $ GHC.currentBytesSlop stats)
-              setGauge maxBytesSlop (fromIntegral $ GHC.maxBytesSlop stats)
-              setGauge
-                peakBytesAllocated
-                (fromIntegral $ GHC.peakMegabytesAllocated stats * 1000000)
-              setGauge mutatorCpuSeconds (GHC.mutatorCpuSeconds stats)
-              setGauge mutatorWallSeconds (GHC.mutatorWallSeconds stats)
-              setGauge gcCpuSeconds (GHC.gcCpuSeconds stats)
-              setGauge gcWallSeconds (GHC.gcWallSeconds stats)
-              setGauge cpuSeconds (GHC.cpuSeconds stats)
-              setGauge wallSeconds (GHC.wallSeconds stats)
-              setGauge
-                parTotBytesCopied
-                (fromIntegral $ GHC.parTotBytesCopied stats)
-              setGauge
-                parMaxBytesCopied
-                (fromIntegral $ GHC.parMaxBytesCopied stats)
-            threadDelay 1000000
+    forkIO $
+    recoverAll (capDelay 60000000 (exponentialBackoff 100)) $ const $ forever $ do
+      stats <- time ghcStatsTime GHC.getGCStats
+      time ghcRecordTime $ do
+        setGauge bytesAllocated (fromIntegral $ GHC.bytesAllocated stats)
+        setGauge numGcs (fromIntegral $ GHC.numGcs stats)
+        setGauge maxBytesUsed (fromIntegral $ GHC.maxBytesUsed stats)
+        setGauge
+          numByteUsageSamples
+          (fromIntegral $ GHC.numByteUsageSamples stats)
+        setGauge
+          cumulativeBytesUsed
+          (fromIntegral $ GHC.cumulativeBytesUsed stats)
+        setGauge bytesCopied (fromIntegral $ GHC.bytesCopied stats)
+        setGauge
+          currentBytesUsed
+          (fromIntegral $ GHC.currentBytesUsed stats)
+        setGauge
+          currentBytesSlop
+          (fromIntegral $ GHC.currentBytesSlop stats)
+        setGauge maxBytesSlop (fromIntegral $ GHC.maxBytesSlop stats)
+        setGauge
+          peakBytesAllocated
+          (fromIntegral $ GHC.peakMegabytesAllocated stats * 1000000)
+        setGauge mutatorCpuSeconds (GHC.mutatorCpuSeconds stats)
+        setGauge mutatorWallSeconds (GHC.mutatorWallSeconds stats)
+        setGauge gcCpuSeconds (GHC.gcCpuSeconds stats)
+        setGauge gcWallSeconds (GHC.gcWallSeconds stats)
+        setGauge cpuSeconds (GHC.cpuSeconds stats)
+        setGauge wallSeconds (GHC.wallSeconds stats)
+        setGauge
+          parTotBytesCopied
+          (fromIntegral $ GHC.parTotBytesCopied stats)
+        setGauge
+          parMaxBytesCopied
+          (fromIntegral $ GHC.parMaxBytesCopied stats)
+      threadDelay 1000000
