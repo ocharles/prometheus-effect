@@ -1,5 +1,5 @@
 name:                prometheus-effect
-version:             1.0.0
+version:             1.1.0
 synopsis:            Instrument applications with metrics and publish/push to Prometheus
 description:
   [Prometheus](https://prometheus.io) is an open-source systems monitoring and
